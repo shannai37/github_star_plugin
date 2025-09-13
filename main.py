@@ -36,6 +36,10 @@ class NetworkError(GitHubAPIError):
     """网络错误"""
     pass
 
+class NotStarredError(GitHubAPIError):
+    """仓库未被star错误"""
+    pass
+
 @dataclass
 class PluginInfo:
     """
@@ -84,6 +88,19 @@ class GitHubAPIClient:
     """
     GitHub API客户端
     负责处理所有GitHub API交互，包括获取仓库信息和点star操作
+    
+    主要功能：
+    - verify_token(): 验证GitHub Token有效性
+    - get_repository_info(): 获取仓库基本信息
+    - star_repository(): 给仓库点star
+    - check_star_status(): 检查是否已点star（区分仓库不存在和未star）
+    - test_connectivity(): 测试GitHub API连通性
+    - update_plugin_stars(): 实时更新插件star数
+    
+    网络安全特性：
+    - 使用HTTP头检查速率限制（X-RateLimit-Remaining）
+    - 精确区分仓库不存在和未star的情况
+    - 统一的错误处理机制
     """
     
     def __init__(self, token: str, config: dict):
@@ -98,15 +115,11 @@ class GitHubAPIClient:
         self.config = config
         
         # API端点配置 - 只使用官方GitHub API
-        self.endpoints = [
-            "https://api.github.com"
-        ]
-        self.current_endpoint = 0
+        self.api_base_url = "https://api.github.com"
         
         # 网络配置
         self.timeout = config.get('api_settings', {}).get('request_timeout', 15)
         self.max_retries = config.get('api_settings', {}).get('max_retries', 3)
-        self.enable_fallback = config.get('api_settings', {}).get('enable_fallback', True)
     
     async def _make_request(self, method: str, url: str, **kwargs) -> dict:
         """
@@ -144,10 +157,21 @@ class GitHubAPIClient:
                 elif response.status == 404:
                     raise RepositoryNotFoundError("仓库不存在或无权访问") 
                 elif response.status == 403:
-                    if "rate limit" in (await response.text()).lower():
+                    # 检查是否为速率限制（优先检查HTTP头）
+                    rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', None)
+                    if rate_limit_remaining == '0':
                         raise RateLimitError("GitHub API请求频率超限")
-                    else:
-                        raise AuthenticationError("权限不足")
+                    
+                    # 如果没有可靠的HTTP头，则检查响应内容（备用方案）
+                    try:
+                        response_text = await response.text()
+                        if "rate limit" in response_text.lower() or "api rate limit" in response_text.lower():
+                            raise RateLimitError("GitHub API请求频率超限")
+                    except Exception:
+                        # 如果无法读取响应内容，则忽略
+                        pass
+                    
+                    raise AuthenticationError("权限不足")
                 elif response.status not in [200, 204]:  # 204 No Content也表示成功
                     raise NetworkError(f"HTTP错误: {response.status}")
                 
@@ -164,7 +188,7 @@ class GitHubAPIClient:
             bool: Token是否有效
         """
         try:
-            await self._make_request("GET", f"{self.endpoints[0]}/user")
+            await self._make_request("GET", f"{self.api_base_url}/user")
             return True
         except Exception as e:
             logger.error(f"Token验证失败: {e}")
@@ -181,7 +205,7 @@ class GitHubAPIClient:
         Returns:
             dict: 仓库信息
         """
-        url = f"{self.endpoints[0]}/repos/{owner}/{repo}"
+        url = f"{self.api_base_url}/repos/{owner}/{repo}"
         return await self._make_request("GET", url)
     
     async def star_repository(self, owner: str, repo: str) -> bool:
@@ -195,7 +219,7 @@ class GitHubAPIClient:
         Returns:
             bool: 是否成功
         """
-        url = f"{self.endpoints[0]}/user/starred/{owner}/{repo}"
+        url = f"{self.api_base_url}/user/starred/{owner}/{repo}"
         try:
             await self._make_request("PUT", url)
             return True
@@ -213,13 +237,27 @@ class GitHubAPIClient:
             
         Returns:
             bool: 是否已点star
+            
+        Raises:
+            RepositoryNotFoundError: 仓库不存在或无权访问
+            NotStarredError: 仓库存在但未被star
+            NetworkError: 网络连接错误
         """
-        url = f"{self.endpoints[0]}/user/starred/{owner}/{repo}"
+        # 首先检查仓库是否存在
+        try:
+            await self.get_repository_info(owner, repo)
+        except RepositoryNotFoundError:
+            # 仓库不存在
+            raise
+        
+        # 然后检查star状态
+        url = f"{self.api_base_url}/user/starred/{owner}/{repo}"
         try:
             await self._make_request("GET", url)
             return True
         except RepositoryNotFoundError:
-            return False
+            # 仓库存在但未star
+            raise NotStarredError("仓库未被star")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"检查star状态时网络错误: {e}")
             raise NetworkError("网络连接失败，无法检查star状态") from e
@@ -255,35 +293,34 @@ class GitHubAPIClient:
     
     async def test_connectivity(self) -> Dict[str, Dict[str, any]]:
         """
-        测试所有API端点的连通性
+        测试GitHub API的连通性
         
         Returns:
-            Dict: 各端点的连通性测试结果
+            Dict: API连通性测试结果
         """
         results = {}
         
         loop = asyncio.get_event_loop()
-        for endpoint in self.endpoints:
-            start_time = loop.time()
-            try:
-                # 测试基本连接
-                test_url = f"{endpoint}/rate_limit"  # GitHub API的轻量级端点
-                await self._make_request("GET", test_url)
-                
-                latency = round((loop.time() - start_time) * 1000)  # 毫秒
-                results[endpoint] = {
-                    'success': True,
-                    'latency': latency,
-                    'error': None
-                }
-                
-            except Exception as e:
-                latency = round((loop.time() - start_time) * 1000)
-                results[endpoint] = {
-                    'success': False,
-                    'latency': latency,
-                    'error': str(e)
-                }
+        start_time = loop.time()
+        try:
+            # 测试基本连接
+            test_url = f"{self.api_base_url}/rate_limit"  # GitHub API的轻量级端点
+            await self._make_request("GET", test_url)
+            
+            latency = round((loop.time() - start_time) * 1000)  # 毫秒
+            results[self.api_base_url] = {
+                'success': True,
+                'latency': latency,
+                'error': None
+            }
+            
+        except Exception as e:
+            latency = round((loop.time() - start_time) * 1000)
+            results[self.api_base_url] = {
+                'success': False,
+                'latency': latency,
+                'error': str(e)
+            }
         
         return results
     
@@ -556,6 +593,21 @@ class GitHubStarManager(Star):
     """
     GitHub Star管理器主类
     集成所有功能，提供用户命令接口
+    
+    命令功能：
+    - find_plugins(): 搜索AstrBot插件（支持分页）
+    - find_by_author(): 按作者搜索插件
+    - star_plugin(): 给插件点star（支持ID、短名称、完整名称）
+    - check_star(): 检查是否已点star
+    - my_github(): 查看GitHub账户信息
+    - test_network(): 测试GitHub API连通性
+    - update_plugins(): 手动更新插件数据库
+    - debug_config(): 调试配置信息（脱敏处理）
+    
+    安全特性：
+    - 简化的权限检查机制（支持JSON数组和逗号分隔）
+    - 脱敏的调试信息输出
+    - 统一的异常处理和错误报告
     """
     
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -612,37 +664,40 @@ class GitHubStarManager(Star):
     
     def _check_permission(self, user_id: str) -> bool:
         """
-        检查用户权限
+        检查用户权限（简化版）
         
         Args:
             user_id: 用户ID
             
         Returns:
             bool: 是否有权限
+            
+        支持的配置格式：
+        - JSON数组: ["123", "456"]
+        - 逗号分隔: "123,456,789" 
+        - 空值: 允许所有用户
         """
         try:
-            allowed_users_str = self.config.get("allowed_users", "")
+            allowed_users_config = self.config.get("allowed_users", "")
             
-            # 处理空配置情况
-            if not allowed_users_str or allowed_users_str.strip() == "":
+            # 如果配置为空，允许所有用户
+            if not allowed_users_config or str(allowed_users_config).strip() == "":
                 return True
             
-            # 解析JSON格式的用户列表
-            if isinstance(allowed_users_str, str):
+            # 尝试解析为用户ID列表
+            if isinstance(allowed_users_config, str):
                 try:
-                    allowed_users = json.loads(allowed_users_str)
+                    # 支持JSON数组格式：["123", "456"]
+                    allowed_users = json.loads(allowed_users_config)
+                    if isinstance(allowed_users, list):
+                        return str(user_id) in [str(uid) for uid in allowed_users]
                 except json.JSONDecodeError:
-                    logger.warning("allowed_users格式错误，允许所有用户访问")
-                    return True
-            else:
-                allowed_users = allowed_users_str
+                    # 支持逗号分隔格式："123,456,789"
+                    allowed_users = [uid.strip() for uid in allowed_users_config.split(',')]
+                    return str(user_id) in allowed_users
             
-            # 检查特殊格式
-            if isinstance(allowed_users, dict):
-                if not allowed_users or allowed_users == {'user_id': ''}:
-                    return True
-                return str(user_id) in allowed_users
-            
+            # 如果配置格式不支持，默认允许访问
+            logger.warning(f"不支持的allowed_users配置格式，允许所有用户访问：{type(allowed_users_config)}")
             return True
             
         except Exception as e:
@@ -651,17 +706,19 @@ class GitHubStarManager(Star):
     
     async def _format_plugin_display(self, plugins: List[PluginInfo], title: str, page: int = 1, page_size: int = 8, update_stars: bool = False) -> str:
         """
-        统一的插件显示格式化方法
+        统一的插件显示格式化方法（修复了AttributeError）
         
         Args:
             plugins: 插件列表
             title: 显示标题
             page: 页码
             page_size: 每页大小
-            update_stars: 是否更新star数
+            update_stars: 是否更新star数（最多10个）
             
         Returns:
             str: 格式化后的显示文本
+            
+        注意：正确使用plugin.short_name而不plugin.get()
         """
         if not plugins:
             return "未找到匹配的插件"
@@ -673,9 +730,9 @@ class GitHubStarManager(Star):
                 try:
                     await self.github_client.update_plugin_stars(plugin)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logger.debug(f"更新插件{plugin.get('short_name', 'unknown')}的star数失败: {e}")
+                    logger.debug(f"更新插件 {plugin.short_name} 的star数失败: {e}")
                 except Exception as e:
-                    logger.warning(f"更新插件{plugin.get('short_name', 'unknown')}时发生意外错误: {e}")
+                    logger.warning(f"更新插件 {plugin.short_name} 时发生意外错误: {e}")
         
         # 分页逻辑
         total_pages = (len(plugins) + page_size - 1) // page_size
@@ -883,6 +940,12 @@ class GitHubStarManager(Star):
                 if already_starred:
                     yield event.plain_result(f"✅ 你已经给 {plugin.short_name} 点过star了\n当前⭐数量: {plugin.stars}")
                     return
+            except RepositoryNotFoundError:
+                yield event.plain_result(f"❌ 仓库不存在或无权访问: {plugin.repo_url}")
+                return
+            except NotStarredError:
+                # 仓库存在但未star，继续点star流程
+                pass
             except NetworkError:
                 yield event.plain_result("⚠️ 无法检查star状态（网络错误），继续尝试点star...")
             except Exception as e:
@@ -942,6 +1005,10 @@ class GitHubStarManager(Star):
             try:
                 starred = await self.github_client.check_star_status(owner, repo)
                 status = "已点star ⭐" if starred else "未点star ☆"
+            except RepositoryNotFoundError:
+                status = "仓库不存在 ❌"
+            except NotStarredError:
+                status = "未点star ☆"
             except NetworkError:
                 status = "检查失败 ⚠️ (网络错误)"
             except Exception as e:
@@ -972,7 +1039,7 @@ class GitHubStarManager(Star):
                 return
             
             # 获取用户信息
-            user_info = await self.github_client._make_request("GET", f"{self.github_client.endpoints[0]}/user")
+            user_info = await self.github_client._make_request("GET", f"{self.github_client.api_base_url}/user")
             
             result = f"""👤 GitHub账户信息:
 用户名: {user_info.get('login', 'N/A')}
@@ -1012,7 +1079,24 @@ class GitHubStarManager(Star):
     async def debug_config(self, event: AstrMessageEvent):
         """调试配置信息"""
         user_id = event.get_sender_id()
-        allowed_users = self.config.get("allowed_users", {})
+        
+        # 获取权限配置信息（脱敏处理）
+        allowed_users_config = self.config.get("allowed_users", "")
+        if allowed_users_config:
+            if isinstance(allowed_users_config, str):
+                try:
+                    allowed_list = json.loads(allowed_users_config)
+                    if isinstance(allowed_list, list):
+                        allowed_info = f"用户列表（共{len(allowed_list)}个用户）"
+                    else:
+                        allowed_info = "特殊配置格式"
+                except json.JSONDecodeError:
+                    user_count = len([u.strip() for u in allowed_users_config.split(',') if u.strip()])
+                    allowed_info = f"逗号分隔的用户列表（共{user_count}个用户）"
+            else:
+                allowed_info = f"其他类型配置: {type(allowed_users_config).__name__}"
+        else:
+            allowed_info = "允许所有用户访问"
         
         # 获取插件数据库统计
         plugin_count = len(self.plugin_db.plugins) if self.plugin_db.plugins else 0
@@ -1021,7 +1105,7 @@ class GitHubStarManager(Star):
         
         debug_info = f"""🔧 调试信息:
 👤 当前用户ID: {user_id} (类型: {type(user_id).__name__})
-🛡️ allowed_users配置: {allowed_users}
+🛡️ 权限配置: {allowed_info}
 🛡️ 权限检查结果: {self._check_permission(user_id)}
 
 📊 插件数据库状态:
@@ -1072,18 +1156,13 @@ GitHub Token: {'已配置' if self.config.get('github_token') else '未配置'}
                 
                 result_text += f"{icon} {display_name}{latency_info}\n"
             
-            # 推荐最佳端点
+            # 显示连通结果
             if working_endpoints:
                 best_endpoint, best_latency = min(working_endpoints, key=lambda x: x[1])
                 best_name = best_endpoint.replace("https://", "").replace("/api", "")
                 if len(best_name) > 30:
                     best_name = best_name[:27] + "..."
-                result_text += f"\n🚀 推荐使用: {best_name} ({best_latency}ms)"
-                
-                # 如果当前使用的不是最佳端点，建议切换
-                current_endpoint = self.github_client.endpoints[self.github_client.current_endpoint]
-                if current_endpoint != best_endpoint:
-                    result_text += f"\n💡 建议切换到最快的端点以获得更好性能"
+                result_text += f"\n🚀 GitHub API连通正常: {best_latency}ms"
             else:
                 result_text += "\n⚠️ 所有端点都无法访问，请检查:\n"
                 result_text += "  • 网络连接\n"
