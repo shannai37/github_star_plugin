@@ -64,6 +64,10 @@ class NotStarredError(GitHubAPIError):
     """仓库未被star错误"""
     pass
 
+class PermissionError(GitHubAPIError):
+    """权限不足错误（Token缺少必要的scope或访问被禁止）"""
+    pass
+
 @dataclass
 class PluginInfo:
     """
@@ -127,8 +131,17 @@ class GitHubAPIClient:
     网络安全特性：
     - 使用HTTP头检查速率限制（X-RateLimit-Remaining）
     - 精确区分仓库不存在和未star的情况
+    - 精确的403错误分类（区分Token认证失败和权限不足）
     - 具体的异常处理（避免过于宽泛的异常捕获）
     - 现代的异步编程实践（asyncio.get_running_loop）
+    
+    异常类型：
+    - AuthenticationError: Token认证失败（Token无效或过期）
+    - PermissionError: 权限不足（Token缺少必要scope或访问被禁止）
+    - RepositoryNotFoundError: 仓库不存在
+    - RateLimitError: API限流
+    - NotStarredError: 仓库未被star
+    - NetworkError: 网络错误
     """
     
     def __init__(self, token: str, config: dict):
@@ -162,7 +175,8 @@ class GitHubAPIClient:
             dict: 响应JSON数据
             
         Raises:
-            AuthenticationError: 认证失败
+            AuthenticationError: Token认证失败（Token无效或过期）
+            PermissionError: 权限不足（Token缺少必要scope或访问被禁止）
             RepositoryNotFoundError: 仓库不存在
             RateLimitError: API限流
             NetworkError: 网络错误
@@ -190,17 +204,49 @@ class GitHubAPIClient:
                     if rate_limit_remaining == '0':
                         raise RateLimitError("GitHub API请求频率超限")
                     
-                    # 如果没有可靠的HTTP头，则检查响应内容（备用方案）
+                    # 获取详细的错误信息用于更精确的分类
+                    error_message = "权限不足"
+                    error_type = "permission"  # 默认为权限问题
+                    
                     try:
                         response_text = await response.text()
-                        if "rate limit" in response_text.lower() or "api rate limit" in response_text.lower():
+                        response_lower = response_text.lower()
+                        
+                        # 检查速率限制（备用方案）
+                        if "rate limit" in response_lower or "api rate limit" in response_lower:
                             raise RateLimitError("GitHub API请求频率超限")
+                        
+                        # 检查Token认证问题
+                        if "bad credentials" in response_lower or "invalid token" in response_lower:
+                            error_type = "authentication"
+                            error_message = "GitHub Token无效或已过期"
+                        
+                        # 检查Token权限范围问题
+                        elif "insufficient" in response_lower or "scope" in response_lower:
+                            error_message = "GitHub Token缺少必要的权限范围（如public_repo）"
+                        
+                        # 检查访问被禁止
+                        elif "forbidden" in response_lower or "access denied" in response_lower:
+                            error_message = "访问被禁止，请检查仓库可见性或Token权限"
+                        
+                        # 其他情况，尝试提取更多信息
+                        else:
+                            # 尝试解析JSON响应获取更详细的错误信息
+                            try:
+                                error_data = json.loads(response_text)
+                                if "message" in error_data:
+                                    error_message = f"权限不足: {error_data['message']}"
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        
                     except (aiohttp.ClientError, UnicodeDecodeError, aiohttp.ClientPayloadError) as e:
-                        # 如果无法读取响应内容，记录日志但不中断处理
-                        logger.debug(f"无法解析403响应体来检查速率限制: {e}")
+                        logger.debug(f"无法解析403响应体: {e}")
                     
-                    # 默认作为权限不足处理
-                    raise AuthenticationError("权限不足")
+                    # 根据错误类型抛出相应的异常
+                    if error_type == "authentication":
+                        raise AuthenticationError(error_message)
+                    else:
+                        raise PermissionError(error_message)
                 elif response.status not in [200, 204]:  # 204 No Content也表示成功
                     raise NetworkError(f"HTTP错误: {response.status}")
                 
@@ -219,8 +265,17 @@ class GitHubAPIClient:
         try:
             await self._make_request("GET", f"{self.api_base_url}/user")
             return True
+        except AuthenticationError as e:
+            logger.error(f"Token认证失败: {e}")
+            return False
+        except PermissionError as e:
+            logger.error(f"Token权限不足: {e}")
+            return False
+        except (RateLimitError, NetworkError) as e:
+            logger.error(f"Token验证时网络错误: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Token验证失败: {e}")
+            logger.error(f"Token验证发生意外错误: {e}")
             return False
     
     async def get_repository_info(self, owner: str, repo: str) -> dict:
@@ -252,8 +307,20 @@ class GitHubAPIClient:
         try:
             await self._make_request("PUT", url)
             return True
+        except AuthenticationError as e:
+            logger.error(f"点star失败（认证错误）: {e}")
+            return False
+        except PermissionError as e:
+            logger.error(f"点star失败（权限不足）: {e}")
+            return False
+        except RepositoryNotFoundError as e:
+            logger.error(f"点star失败（仓库不存在）: {e}")
+            return False
+        except (RateLimitError, NetworkError) as e:
+            logger.error(f"点star失败（网络错误）: {e}")
+            return False
         except Exception as e:
-            logger.error(f"点star失败: {e}")
+            logger.error(f"点star发生意外错误: {e}")
             return False
     
     async def check_star_status(self, owner: str, repo: str) -> bool:
