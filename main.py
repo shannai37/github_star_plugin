@@ -5,7 +5,6 @@ GitHub Star Manager Plugin for AstrBot
 
 import asyncio
 import json
-import time
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 import re
@@ -78,6 +77,7 @@ class PluginInfo:
     - 使用dataclasses.field(default_factory=list)正确处理可变默认参数
     - 自动生成短名称（_generate_short_name）
     - 支持灵活的数据格式适配
+    - 符合Python 3.10+的现代编程惯例
     """
     name: str              # 插件名称
     author: str            # 作者名
@@ -132,8 +132,13 @@ class GitHubAPIClient:
     - 使用HTTP头检查速率限制（X-RateLimit-Remaining）
     - 精确区分仓库不存在和未star的情况
     - 精确的403错误分类（区分Token认证失败和权限不足）
+    - 模块化的错误处理（_parse_403_error方法）
     - 具体的异常处理（避免过于宽泛的异常捕获）
     - 现代的异步编程实践（asyncio.get_running_loop）
+    
+    核心方法：
+    - _parse_403_error(): 精确解析403错误响应，避免歧义
+    - _make_request(): 统一的HTTP请求处理和错误分类
     
     异常类型：
     - AuthenticationError: Token认证失败（Token无效或过期）
@@ -161,6 +166,49 @@ class GitHubAPIClient:
         # 网络配置
         self.timeout = config.get('api_settings', {}).get('request_timeout', 15)
         self.max_retries = config.get('api_settings', {}).get('max_retries', 3)
+    
+    def _parse_403_error(self, response_text: str) -> tuple[str, str]:
+        """
+        解析403错误响应体，返回错误类型和消息
+        
+        Args:
+            response_text: HTTP响应体文本
+            
+        Returns:
+            tuple: (错误类型, 错误消息)
+                  错误类型: "rate_limit", "authentication", "permission"
+        """
+        if not response_text:
+            return "permission", "权限不足"
+        
+        response_lower = response_text.lower()
+        
+        # 检查速率限制
+        if "rate limit" in response_lower or "api rate limit" in response_lower:
+            return "rate_limit", "GitHub API请求频率超限"
+        
+        # 检查Token认证问题
+        if "bad credentials" in response_lower or "invalid token" in response_lower:
+            return "authentication", "GitHub Token无效或已过期"
+        
+        # 检查Token权限范围问题
+        if "insufficient" in response_lower or "scope" in response_lower:
+            return "permission", "GitHub Token缺少必要的权限范围（如public_repo）"
+        
+        # 检查访问被禁止
+        if "forbidden" in response_lower or "access denied" in response_lower:
+            return "permission", "访问被禁止，请检查仓库可见性或Token权限"
+        
+        # 尝试解析JSON响应获取更详细的错误信息
+        try:
+            error_data = json.loads(response_text)
+            if "message" in error_data:
+                return "permission", f"权限不足: {error_data['message']}"
+        except (json.JSONDecodeError, KeyError):
+            pass
+        
+        # 默认作为权限问题
+        return "permission", "权限不足"
     
     async def _make_request(self, method: str, url: str, **kwargs) -> dict:
         """
@@ -199,50 +247,28 @@ class GitHubAPIClient:
                 elif response.status == 404:
                     raise RepositoryNotFoundError("仓库不存在或无权访问") 
                 elif response.status == 403:
-                    # 检查是否为速率限制（优先检查HTTP头）
+                    # 优先检查HTTP头中的速率限制信息
                     rate_limit_remaining = response.headers.get('X-RateLimit-Remaining', None)
                     if rate_limit_remaining == '0':
                         raise RateLimitError("GitHub API请求频率超限")
                     
-                    # 获取详细的错误信息用于更精确的分类
-                    error_message = "权限不足"
+                    # 获取响应体并解析错误类型
                     error_type = "permission"  # 默认为权限问题
+                    error_message = "权限不足"
                     
                     try:
                         response_text = await response.text()
-                        response_lower = response_text.lower()
+                        error_type, error_message = self._parse_403_error(response_text)
                         
-                        # 检查速率限制（备用方案）
-                        if "rate limit" in response_lower or "api rate limit" in response_lower:
-                            raise RateLimitError("GitHub API请求频率超限")
-                        
-                        # 检查Token认证问题
-                        if "bad credentials" in response_lower or "invalid token" in response_lower:
-                            error_type = "authentication"
-                            error_message = "GitHub Token无效或已过期"
-                        
-                        # 检查Token权限范围问题
-                        elif "insufficient" in response_lower or "scope" in response_lower:
-                            error_message = "GitHub Token缺少必要的权限范围（如public_repo）"
-                        
-                        # 检查访问被禁止
-                        elif "forbidden" in response_lower or "access denied" in response_lower:
-                            error_message = "访问被禁止，请检查仓库可见性或Token权限"
-                        
-                        # 其他情况，尝试提取更多信息
-                        else:
-                            # 尝试解析JSON响应获取更详细的错误信息
-                            try:
-                                error_data = json.loads(response_text)
-                                if "message" in error_data:
-                                    error_message = f"权限不足: {error_data['message']}"
-                            except (json.JSONDecodeError, KeyError):
-                                pass
+                        # 如果解析出是速率限制，直接抛出对应异常
+                        if error_type == "rate_limit":
+                            raise RateLimitError(error_message)
                         
                     except (aiohttp.ClientError, UnicodeDecodeError, aiohttp.ClientPayloadError) as e:
                         logger.debug(f"无法解析403响应体: {e}")
+                        # 使用默认值
                     
-                    # 根据错误类型抛出相应的异常
+                    # 根据解析结果抛出相应的异常
                     if error_type == "authentication":
                         raise AuthenticationError(error_message)
                     else:
@@ -646,41 +672,42 @@ class PluginDatabase:
     
     def find_plugin_by_identifier(self, identifier: str) -> Optional[PluginInfo]:
         """
-        通过ID、短名称或完整名称查找插件
+        通过ID、短名称或完整名称查找插件（精确匹配）
         
         Args:
             identifier: 插件标识符（ID、短名称或完整名称）
             
         Returns:
             PluginInfo: 找到的插件，未找到返回None
+            
+        注意：为避免歧义，只支持精确匹配。如需模糊搜索，请使用 /find_plugins 命令。
         """
         if not identifier:
             return None
         
         identifier = identifier.strip()
         
-        # 尝试数字ID
+        # 1. 尝试数字ID匹配（最高优先级）
         if identifier.isdigit():
             plugin_id = int(identifier)
             for plugin in self.plugins:
                 if plugin.plugin_id == plugin_id:
                     return plugin
         
-        # 尝试短名称匹配（不区分大小写）
         identifier_lower = identifier.lower()
+        
+        # 2. 尝试短名称精确匹配（不区分大小写）
         for plugin in self.plugins:
             if plugin.short_name.lower() == identifier_lower:
                 return plugin
         
-        # 尝试完整名称匹配
+        # 3. 尝试完整名称精确匹配（不区分大小写）
         for plugin in self.plugins:
             if plugin.name.lower() == identifier_lower:
                 return plugin
         
-        # 尝试模糊匹配（包含关系）
-        for plugin in self.plugins:
-            if identifier_lower in plugin.name.lower():
-                return plugin
+        # 移除模糊匹配逻辑以避免歧义
+        # 用户可以使用 /find_plugins 命令进行模糊搜索
         
         return None
 
@@ -704,9 +731,16 @@ class GitHubStarManager(Star):
     安全特性：
     - 权限检查装饰器（@require_permission）避免代码重复
     - 重构的权限配置解析逻辑（_parse_allowed_users_config）
-    - 简化的权限检查机制（支持JSON数组和逗号分隔）
+    - 支持多种权限配置格式（Python列表、JSON字符串、逗号分隔）
+    - 精确的插件查找（移除模糊匹配避免歧义）
     - 脱敏的调试信息输出
     - 统一的异常处理和错误报告
+    
+    核心方法：
+    - _parse_allowed_users_config(): 统一的权限配置解析逻辑
+    - _check_permission(): 简化的权限检查机制
+    - _format_plugin_display(): 统一的插件显示格式化
+    - find_plugin_by_identifier(): 精确的插件查找（仅精确匹配）
     """
     
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -765,32 +799,50 @@ class GitHubStarManager(Star):
         """
         解析权限配置
         
+        支持的配置格式：
+        1. Python列表: ["123", "456"]
+        2. JSON字符串: "[\"123\", \"456\"]"
+        3. 逗号分隔: "123,456,789"
+        4. 空值: 允许所有用户
+        
         Returns:
             tuple: (用户ID列表, 描述信息)
         """
         allowed_users_config = self.config.get("allowed_users", "")
         
+        # 处理已经是Python列表的情况（框架已解析）
+        if isinstance(allowed_users_config, list):
+            user_list = [str(uid) for uid in allowed_users_config if uid is not None]
+            if not user_list:  # 空列表允许所有用户
+                return [], "允许所有用户访问"
+            return user_list, f"用户列表（共{len(user_list)}个用户）"
+        
         # 如果配置为空，允许所有用户
         if not allowed_users_config or str(allowed_users_config).strip() == "":
             return [], "允许所有用户访问"
         
-        # 尝试解析为用户ID列表
+        # 处理字符串格式的配置
         if isinstance(allowed_users_config, str):
             try:
-                # 支持JSON数组格式：["123", "456"]
+                # 支持JSON数组格式："[\"123\", \"456\"]"
                 allowed_users = json.loads(allowed_users_config)
                 if isinstance(allowed_users, list):
-                    user_list = [str(uid) for uid in allowed_users]
-                    return user_list, f"用户列表（共{len(user_list)}个用户）"
+                    user_list = [str(uid) for uid in allowed_users if uid is not None]
+                    if not user_list:  # 空列表允许所有用户
+                        return [], "允许所有用户访问"
+                    return user_list, f"JSON用户列表（共{len(user_list)}个用户）"
                 else:
-                    return [], "特殊配置格式"
+                    return [], "不支持的JSON格式（非array）"
             except json.JSONDecodeError:
                 # 支持逗号分隔格式："123,456,789"
                 user_list = [uid.strip() for uid in allowed_users_config.split(',') if uid.strip()]
+                if not user_list:  # 空列表允许所有用户
+                    return [], "允许所有用户访问"
                 return user_list, f"逗号分隔的用户列表（共{len(user_list)}个用户）"
         
-        # 如果配置格式不支持
-        return [], f"其他类型配置: {type(allowed_users_config).__name__}"
+        # 其他不支持的类型，记录警告并允许所有用户访问
+        logger.warning(f"不支持的allowed_users配置类型: {type(allowed_users_config).__name__}, 将允许所有用户访问")
+        return [], f"不支持的配置类型: {type(allowed_users_config).__name__}"
     
     def _check_permission(self, user_id: str) -> bool:
         """
@@ -823,19 +875,17 @@ class GitHubStarManager(Star):
     
     async def _format_plugin_display(self, plugins: List[PluginInfo], title: str, page: int = 1, page_size: int = 8, update_stars: bool = False) -> str:
         """
-        统一的插件显示格式化方法（修复了AttributeError）
+        统一的插件显示格式化方法
         
         Args:
             plugins: 插件列表
             title: 显示标题
-            page: 页码
-            page_size: 每页大小
-            update_stars: 是否更新star数（最多10个）
+            page: 页码（默认为1）
+            page_size: 每页显示的插件数量（默认为8）
+            update_stars: 是否实时更新star数（最多更新10个，默认False）
             
         Returns:
-            str: 格式化后的显示文本
-            
-        注意：正确使用plugin.short_name而不plugin.get()
+            str: 格式化后的插件列表显示文本，包含分页信息和使用说明
         """
         if not plugins:
             return "未找到匹配的插件"
