@@ -9,14 +9,11 @@ import time
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import re
-import logging
 
 import aiohttp
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import AstrBotConfig
-
-logger = logging.getLogger(__name__)
+from astrbot.api import AstrBotConfig, logger
 
 # 自定义异常类
 class GitHubAPIError(Exception):
@@ -223,8 +220,12 @@ class GitHubAPIClient:
             return True
         except RepositoryNotFoundError:
             return False
-        except Exception:
-            return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"检查star状态时网络错误: {e}")
+            raise NetworkError("网络连接失败，无法检查star状态") from e
+        except Exception as e:
+            logger.error(f"检查star状态时发生意外错误: {e}")
+            raise
     
     def _parse_repo_url(self, url: str) -> tuple:
         """
@@ -261,14 +262,15 @@ class GitHubAPIClient:
         """
         results = {}
         
+        loop = asyncio.get_event_loop()
         for endpoint in self.endpoints:
-            start_time = time.time()
+            start_time = loop.time()
             try:
                 # 测试基本连接
                 test_url = f"{endpoint}/rate_limit"  # GitHub API的轻量级端点
                 await self._make_request("GET", test_url)
                 
-                latency = round((time.time() - start_time) * 1000)  # 毫秒
+                latency = round((loop.time() - start_time) * 1000)  # 毫秒
                 results[endpoint] = {
                     'success': True,
                     'latency': latency,
@@ -276,7 +278,7 @@ class GitHubAPIClient:
                 }
                 
             except Exception as e:
-                latency = round((time.time() - start_time) * 1000)
+                latency = round((loop.time() - start_time) * 1000)
                 results[endpoint] = {
                     'success': False,
                     'latency': latency,
@@ -370,7 +372,8 @@ class PluginDatabase:
                             for i, plugin in enumerate(self.plugins, 1):
                                 plugin.plugin_id = i
                             
-                            self.last_update = time.time()
+                            loop = asyncio.get_event_loop()
+                            self.last_update = loop.time()
                             
                             logger.info(f"成功加载 {len(self.plugins)} 个插件")
                             return True
@@ -436,7 +439,8 @@ class PluginDatabase:
         Returns:
             bool: 是否需要更新并成功更新
         """
-        if time.time() - self.last_update < self.cache_ttl:
+        loop = asyncio.get_event_loop()
+        if loop.time() - self.last_update < self.cache_ttl:
             return False
         
         return await self.load_plugins_from_collection()
@@ -643,7 +647,7 @@ class GitHubStarManager(Star):
             
         except Exception as e:
             logger.error(f"权限检查异常: {e}")
-            return True  # 异常时允许访问，避免插件完全不可用
+            return False  # 故障安全：异常时拒绝访问
     
     async def _format_plugin_display(self, plugins: List[PluginInfo], title: str, page: int = 1, page_size: int = 8, update_stars: bool = False) -> str:
         """
@@ -668,8 +672,10 @@ class GitHubStarManager(Star):
             for plugin in plugins[:update_count]:
                 try:
                     await self.github_client.update_plugin_stars(plugin)
-                except:
-                    pass  # 忽略更新失败
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.debug(f"更新插件{plugin.get('short_name', 'unknown')}的star数失败: {e}")
+                except Exception as e:
+                    logger.warning(f"更新插件{plugin.get('short_name', 'unknown')}时发生意外错误: {e}")
         
         # 分页逻辑
         total_pages = (len(plugins) + page_size - 1) // page_size
@@ -872,10 +878,15 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"⭐ 正在给 [{plugin.plugin_id}] {plugin.short_name} 点star...")
             
             # 检查是否已点star
-            already_starred = await self.github_client.check_star_status(owner, repo)
-            if already_starred:
-                yield event.plain_result(f"✅ 你已经给 {plugin.short_name} 点过star了\n当前⭐数量: {plugin.stars}")
-                return
+            try:
+                already_starred = await self.github_client.check_star_status(owner, repo)
+                if already_starred:
+                    yield event.plain_result(f"✅ 你已经给 {plugin.short_name} 点过star了\n当前⭐数量: {plugin.stars}")
+                    return
+            except NetworkError:
+                yield event.plain_result("⚠️ 无法检查star状态（网络错误），继续尝试点star...")
+            except Exception as e:
+                yield event.plain_result(f"⚠️ 检查star状态失败: {str(e)}，继续尝试点star...")
             
             # 点star
             success = await self.github_client.star_repository(owner, repo)
@@ -928,9 +939,14 @@ class GitHubStarManager(Star):
                 return
             
             # 检查star状态
-            starred = await self.github_client.check_star_status(owner, repo)
-            
-            status = "已点star ⭐" if starred else "未点star ☆"
+            try:
+                starred = await self.github_client.check_star_status(owner, repo)
+                status = "已点star ⭐" if starred else "未点star ☆"
+            except NetworkError:
+                status = "检查失败 ⚠️ (网络错误)"
+            except Exception as e:
+                logger.warning(f"检查star状态失败: {e}")
+                status = "检查失败 ⚠️"
             result = f"📦 [{plugin.plugin_id}] {plugin.short_name}\n"
             result += f"👤 作者: {plugin.author}\n"
             result += f"⭐ 当前Stars: {plugin.stars}\n"
@@ -1000,7 +1016,8 @@ class GitHubStarManager(Star):
         
         # 获取插件数据库统计
         plugin_count = len(self.plugin_db.plugins) if self.plugin_db.plugins else 0
-        last_update = "从未更新" if self.plugin_db.last_update == 0 else f"{int(time.time() - self.plugin_db.last_update)}秒前"
+        loop = asyncio.get_event_loop()
+        last_update = "从未更新" if self.plugin_db.last_update == 0 else f"{int(loop.time() - self.plugin_db.last_update)}秒前"
         
         debug_info = f"""🔧 调试信息:
 👤 当前用户ID: {user_id} (类型: {type(user_id).__name__})
