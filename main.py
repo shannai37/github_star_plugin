@@ -7,13 +7,37 @@ import asyncio
 import json
 import time
 from typing import List, Dict, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
+from functools import wraps
 
 import aiohttp
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
+
+def require_permission(func):
+    """
+    权限检查装饰器
+    用于统一处理命令方法的权限检查
+    
+    Args:
+        func: 需要权限检查的方法
+        
+    Returns:
+        装饰后的方法
+    """
+    @wraps(func)
+    async def wrapper(self, event: AstrMessageEvent, *args, **kwargs):
+        if not self._check_permission(event.get_sender_id()):
+            yield event.plain_result("❌ 权限不足，请联系管理员")
+            return
+        
+        # 如果权限检查通过，调用原方法
+        async for result in func(self, event, *args, **kwargs):
+            yield result
+    
+    return wrapper
 
 # 自定义异常类
 class GitHubAPIError(Exception):
@@ -45,6 +69,11 @@ class PluginInfo:
     """
     插件信息数据类
     存储从plugins.json解析出的插件基本信息
+    
+    特性：
+    - 使用dataclasses.field(default_factory=list)正确处理可变默认参数
+    - 自动生成短名称（_generate_short_name）
+    - 支持灵活的数据格式适配
     """
     name: str              # 插件名称
     author: str            # 作者名
@@ -52,13 +81,11 @@ class PluginInfo:
     repo_url: str          # GitHub仓库地址
     stars: int = 0         # Star数量
     language: str = "Python"  # 编程语言
-    tags: List[str] = None    # 标签列表
+    tags: List[str] = field(default_factory=list)  # 标签列表
     short_name: str = ""   # 短名称/别名
     plugin_id: int = 0     # 插件ID（用于快速引用）
     
     def __post_init__(self):
-        if self.tags is None:
-            self.tags = []
         if not self.short_name:
             # 自动生成短名称
             self.short_name = self._generate_short_name()
@@ -94,13 +121,14 @@ class GitHubAPIClient:
     - get_repository_info(): 获取仓库基本信息
     - star_repository(): 给仓库点star
     - check_star_status(): 检查是否已点star（区分仓库不存在和未star）
-    - test_connectivity(): 测试GitHub API连通性
+    - test_connectivity(): 测试GitHub API连通性（使用现代事件循环API）
     - update_plugin_stars(): 实时更新插件star数
     
     网络安全特性：
     - 使用HTTP头检查速率限制（X-RateLimit-Remaining）
     - 精确区分仓库不存在和未star的情况
-    - 统一的错误处理机制
+    - 具体的异常处理（避免过于宽泛的异常捕获）
+    - 现代的异步编程实践（asyncio.get_running_loop）
     """
     
     def __init__(self, token: str, config: dict):
@@ -167,10 +195,11 @@ class GitHubAPIClient:
                         response_text = await response.text()
                         if "rate limit" in response_text.lower() or "api rate limit" in response_text.lower():
                             raise RateLimitError("GitHub API请求频率超限")
-                    except Exception:
-                        # 如果无法读取响应内容，则忽略
-                        pass
+                    except (aiohttp.ClientError, UnicodeDecodeError, aiohttp.ClientPayloadError) as e:
+                        # 如果无法读取响应内容，记录日志但不中断处理
+                        logger.debug(f"无法解析403响应体来检查速率限制: {e}")
                     
+                    # 默认作为权限不足处理
                     raise AuthenticationError("权限不足")
                 elif response.status not in [200, 204]:  # 204 No Content也表示成功
                     raise NetworkError(f"HTTP错误: {response.status}")
@@ -300,7 +329,7 @@ class GitHubAPIClient:
         """
         results = {}
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         start_time = loop.time()
         try:
             # 测试基本连接
@@ -409,7 +438,7 @@ class PluginDatabase:
                             for i, plugin in enumerate(self.plugins, 1):
                                 plugin.plugin_id = i
                             
-                            loop = asyncio.get_event_loop()
+                            loop = asyncio.get_running_loop()
                             self.last_update = loop.time()
                             
                             logger.info(f"成功加载 {len(self.plugins)} 个插件")
@@ -476,7 +505,7 @@ class PluginDatabase:
         Returns:
             bool: 是否需要更新并成功更新
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if loop.time() - self.last_update < self.cache_ttl:
             return False
         
@@ -595,6 +624,7 @@ class GitHubStarManager(Star):
     集成所有功能，提供用户命令接口
     
     命令功能：
+    - show_help(): 显示插件帮助信息（无需权限）
     - find_plugins(): 搜索AstrBot插件（支持分页）
     - find_by_author(): 按作者搜索插件
     - star_plugin(): 给插件点star（支持ID、短名称、完整名称）
@@ -605,6 +635,8 @@ class GitHubStarManager(Star):
     - debug_config(): 调试配置信息（脱敏处理）
     
     安全特性：
+    - 权限检查装饰器（@require_permission）避免代码重复
+    - 重构的权限配置解析逻辑（_parse_allowed_users_config）
     - 简化的权限检查机制（支持JSON数组和逗号分隔）
     - 脱敏的调试信息输出
     - 统一的异常处理和错误报告
@@ -662,6 +694,37 @@ class GitHubStarManager(Star):
             logger.error(f"初始化失败: {e}")
             return False
     
+    def _parse_allowed_users_config(self) -> tuple[list, str]:
+        """
+        解析权限配置
+        
+        Returns:
+            tuple: (用户ID列表, 描述信息)
+        """
+        allowed_users_config = self.config.get("allowed_users", "")
+        
+        # 如果配置为空，允许所有用户
+        if not allowed_users_config or str(allowed_users_config).strip() == "":
+            return [], "允许所有用户访问"
+        
+        # 尝试解析为用户ID列表
+        if isinstance(allowed_users_config, str):
+            try:
+                # 支持JSON数组格式：["123", "456"]
+                allowed_users = json.loads(allowed_users_config)
+                if isinstance(allowed_users, list):
+                    user_list = [str(uid) for uid in allowed_users]
+                    return user_list, f"用户列表（共{len(user_list)}个用户）"
+                else:
+                    return [], "特殊配置格式"
+            except json.JSONDecodeError:
+                # 支持逗号分隔格式："123,456,789"
+                user_list = [uid.strip() for uid in allowed_users_config.split(',') if uid.strip()]
+                return user_list, f"逗号分隔的用户列表（共{len(user_list)}个用户）"
+        
+        # 如果配置格式不支持
+        return [], f"其他类型配置: {type(allowed_users_config).__name__}"
+    
     def _check_permission(self, user_id: str) -> bool:
         """
         检查用户权限（简化版）
@@ -678,27 +741,14 @@ class GitHubStarManager(Star):
         - 空值: 允许所有用户
         """
         try:
-            allowed_users_config = self.config.get("allowed_users", "")
+            user_list, _ = self._parse_allowed_users_config()
             
-            # 如果配置为空，允许所有用户
-            if not allowed_users_config or str(allowed_users_config).strip() == "":
+            # 如果没有配置或空列表，允许所有用户
+            if not user_list:
                 return True
             
-            # 尝试解析为用户ID列表
-            if isinstance(allowed_users_config, str):
-                try:
-                    # 支持JSON数组格式：["123", "456"]
-                    allowed_users = json.loads(allowed_users_config)
-                    if isinstance(allowed_users, list):
-                        return str(user_id) in [str(uid) for uid in allowed_users]
-                except json.JSONDecodeError:
-                    # 支持逗号分隔格式："123,456,789"
-                    allowed_users = [uid.strip() for uid in allowed_users_config.split(',')]
-                    return str(user_id) in allowed_users
-            
-            # 如果配置格式不支持，默认允许访问
-            logger.warning(f"不支持的allowed_users配置格式，允许所有用户访问：{type(allowed_users_config)}")
-            return True
+            # 检查用户ID是否在允许列表中
+            return str(user_id) in user_list
             
         except Exception as e:
             logger.error(f"权限检查异常: {e}")
@@ -797,6 +847,7 @@ class GitHubStarManager(Star):
         yield event.plain_result(help_text)
     
     @filter.command("find_plugins")
+    @require_permission
     async def find_plugins(self, event: AstrMessageEvent, keyword: str = "", page: int = 1):
         """
         搜索AstrBot插件（支持分页）
@@ -806,9 +857,6 @@ class GitHubStarManager(Star):
             page: 页码（默认第1页）
         """
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
@@ -844,6 +892,7 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
     
     @filter.command("find_by_author")
+    @require_permission
     async def find_by_author(self, event: AstrMessageEvent, author: str):
         """
         按作者搜索AstrBot插件
@@ -852,9 +901,6 @@ class GitHubStarManager(Star):
             author: 作者名
         """
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
@@ -896,6 +942,7 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 搜索失败: {str(e)}")
     
     @filter.command("star_plugin")
+    @require_permission
     async def star_plugin(self, event: AstrMessageEvent, plugin_identifier: str):
         """
         给插件点star（支持ID、短名称或完整名称）
@@ -904,9 +951,6 @@ class GitHubStarManager(Star):
             plugin_identifier: 插件标识符（ID、短名称或完整名称）
         """
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
@@ -965,6 +1009,7 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 操作失败: {str(e)}")
     
     @filter.command("check_star")
+    @require_permission
     async def check_star(self, event: AstrMessageEvent, plugin_identifier: str):
         """
         检查是否已给插件点star（支持ID、短名称或完整名称）
@@ -973,9 +1018,6 @@ class GitHubStarManager(Star):
             plugin_identifier: 插件标识符（ID、短名称或完整名称）
         """
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
@@ -1026,12 +1068,10 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 检查失败: {str(e)}")
     
     @filter.command("my_github")
+    @require_permission
     async def my_github(self, event: AstrMessageEvent):
         """查看GitHub账户信息"""
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
@@ -1056,12 +1096,10 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 获取失败: {str(e)}")
     
     @filter.command("update_plugins")
+    @require_permission
     async def update_plugins(self, event: AstrMessageEvent):
         """手动更新插件数据库"""
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             yield event.plain_result("🔄 正在更新插件数据库...")
             
@@ -1076,31 +1114,17 @@ class GitHubStarManager(Star):
             yield event.plain_result(f"❌ 更新失败: {str(e)}")
     
     @filter.command("debug_config")
+    @require_permission
     async def debug_config(self, event: AstrMessageEvent):
         """调试配置信息"""
         user_id = event.get_sender_id()
         
-        # 获取权限配置信息（脱敏处理）
-        allowed_users_config = self.config.get("allowed_users", "")
-        if allowed_users_config:
-            if isinstance(allowed_users_config, str):
-                try:
-                    allowed_list = json.loads(allowed_users_config)
-                    if isinstance(allowed_list, list):
-                        allowed_info = f"用户列表（共{len(allowed_list)}个用户）"
-                    else:
-                        allowed_info = "特殊配置格式"
-                except json.JSONDecodeError:
-                    user_count = len([u.strip() for u in allowed_users_config.split(',') if u.strip()])
-                    allowed_info = f"逗号分隔的用户列表（共{user_count}个用户）"
-            else:
-                allowed_info = f"其他类型配置: {type(allowed_users_config).__name__}"
-        else:
-            allowed_info = "允许所有用户访问"
+        # 使用重构后的权限配置解析方法
+        user_list, allowed_info = self._parse_allowed_users_config()
         
         # 获取插件数据库统计
         plugin_count = len(self.plugin_db.plugins) if self.plugin_db.plugins else 0
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         last_update = "从未更新" if self.plugin_db.last_update == 0 else f"{int(loop.time() - self.plugin_db.last_update)}秒前"
         
         debug_info = f"""🔧 调试信息:
@@ -1120,12 +1144,10 @@ GitHub Token: {'已配置' if self.config.get('github_token') else '未配置'}
         yield event.plain_result(debug_info)
     
     @filter.command("test_network")
+    @require_permission
     async def test_network(self, event: AstrMessageEvent):
         """测试GitHub API连通性"""
         try:
-            if not self._check_permission(event.get_sender_id()):
-                yield event.plain_result("❌ 权限不足，请联系管理员")
-                return
             
             await self.initialize()
             if not self.initialized:
