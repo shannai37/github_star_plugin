@@ -1,0 +1,42 @@
+{
+  "github_token": {
+    "description": "你的GitHub Personal Access Token",
+    "type": "string",
+    "hint": "在 GitHub Settings > Developer settings > Personal access tokens 创建。需要 public_repo 权限",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "github_username": {
+    "description": "你的GitHub用户名",
+    "type": "string",
+    "hint": "用于验证token的有效性",
+    "default": ""
+  },
+  "allowed_users": {
+    "description": "允许使用插件的用户ID列表 (JSON格式)",
+    "type": "text",
+    "hint": "格式: {\"用户QQ号1\": true, \"用户QQ号2\": true}。留空或 {} 则允许所有用户使用。例如: {\"2829315582\": true}",
+    "default": "{}"
+  },
+  "api_settings": {
+    "description": "API设置",
+    "type": "object",
+    "items": {
+      "request_timeout": {
+        "description": "请求超时时间(秒)",
+        "type": "int",
+        "default": 15
+      },
+      "max_retries": {
+        "description": "最大重试次数",
+        "type": "int",
+        "default": 3
+      },
+      "enable_fallback": {
+        "description": "启用API镜像端点故障转移",
+        "type": "bool",
+        "default": true
+      }
+    }
+  }
+}
