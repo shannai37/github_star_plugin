@@ -710,7 +710,7 @@ class PluginDatabase:
         
         return None
 
-@register("github_star_manager", "AstrBot助手", "智能发现和点赞AstrBot插件的GitHub Star管理器", "1.0.0", "https://github.com/your_repo/github_star_manager")
+@register("github_star_manager", "山萘", "智能发现和点赞AstrBot插件的GitHub Star管理器", "1.1.0", "https://github.com/shannai37/github_star_plugin")
 class GitHubStarManager(Star):
     """
     GitHub Star管理器主类
