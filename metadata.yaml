@@ -1,10 +1,9 @@
 name: "github_star_manager"
 author: "山萘"
-description: "GitHub插件Star管理器 - 智能点赞AstrBot插件"
-version: "1.0.0"
+description: "GitHub插件Star管理器 - 智能发现、管理和批量点赞AstrBot插件"
+version: "1.1.0"
 repo: "https://github.com/shannai37/github_star_plugin"
-tags: ["工具", "GitHub", "开源"]
+tags: ["工具", "GitHub", "开源", "批量管理"]
 license: "MIT"
 python_version: ">=3.10"
 astrbot_version: ">=3.4.0"
-

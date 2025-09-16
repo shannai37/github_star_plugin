@@ -124,7 +124,6 @@ class GitHubAPIClient:
     - verify_token(): 验证GitHub Token有效性
     - get_repository_info(): 获取仓库基本信息
     - star_repository(): 给仓库点star
-    - check_star_status(): 检查是否已点star（区分仓库不存在和未star）
     - test_connectivity(): 测试GitHub API连通性（使用现代事件循环API）
     - update_plugin_stars(): 实时更新插件star数
     
@@ -160,11 +159,11 @@ class GitHubAPIClient:
         self.token = token
         self.config = config
         
-        # API端点配置 - 只使用官方GitHub API
+        # API端点配置 
         self.api_base_url = "https://api.github.com"
         
         # 网络配置
-        self.timeout = config.get('api_settings', {}).get('request_timeout', 15)
+        self.timeout = config.get('api_settings', {}).get('request_timeout', 20)
         self.max_retries = config.get('api_settings', {}).get('max_retries', 3)
     
     def _parse_403_error(self, response_text: str) -> tuple[str, str]:
@@ -722,7 +721,6 @@ class GitHubStarManager(Star):
     - find_plugins(): 搜索AstrBot插件（支持分页）
     - find_by_author(): 按作者搜索插件
     - star_plugin(): 给插件点star（支持ID、短名称、完整名称）
-    - check_star(): 检查是否已点star
     - my_github(): 查看GitHub账户信息
     - test_network(): 测试GitHub API连通性
     - update_plugins(): 手动更新插件数据库
@@ -940,7 +938,8 @@ class GitHubStarManager(Star):
 • /find_plugins [关键词] [页码] - 搜索AstrBot插件（支持分页）
 • /find_by_author <作者> - 按作者搜索插件
 • /star_plugin <ID或名称> - 给插件点star
-• /check_star <ID或名称> - 检查是否已点star
+• /list_installed [页码] - 显示已安装插件及star状态
+• /starall - 批量star所有已安装的GitHub插件
 • /my_github - 查看GitHub账户信息
 • /test_network - 测试GitHub API连通性
 • /update_plugins - 手动更新插件数据库
@@ -952,6 +951,9 @@ class GitHubStarManager(Star):
 • /find_by_author anka-afk - 查找该作者的所有AstrBot插件
 • /star_plugin 1 - 给ID为1的插件点star
 • /star_plugin context_enhancer - 给短名称匹配的插件点star
+• /list_installed - 查看已安装插件列表
+• /list_installed 2 - 查看已安装插件第2页
+• /starall - 批量star所有已安装的GitHub插件
 
 🔍 插件标识符说明:
 • 数字ID: [1] [2] [3] (显示在搜索结果中)
@@ -1125,65 +1127,6 @@ class GitHubStarManager(Star):
             logger.error(f"点star失败: {e}")
             yield event.plain_result(f"❌ 操作失败: {str(e)}")
     
-    @filter.command("check_star")
-    @require_permission
-    async def check_star(self, event: AstrMessageEvent, plugin_identifier: str):
-        """
-        检查是否已给插件点star（支持ID、短名称或完整名称）
-        
-        Args:
-            plugin_identifier: 插件标识符（ID、短名称或完整名称）
-        """
-        try:
-            
-            await self.initialize()
-            if not self.initialized:
-                yield event.plain_result("❌ 插件未正确初始化")
-                return
-            
-            if not plugin_identifier.strip():
-                yield event.plain_result("请输入插件ID、短名称或完整名称")
-                return
-            
-            # 查找插件
-            plugin = self.plugin_db.find_plugin_by_identifier(plugin_identifier)
-            if not plugin:
-                yield event.plain_result(f"未找到插件: {plugin_identifier}\n💡 使用 /find_plugins 搜索插件")
-                return
-            
-            # 实时更新star数
-            plugin = await self.github_client.update_plugin_stars(plugin)
-            
-            owner, repo = self.github_client._parse_repo_url(plugin.repo_url)
-            
-            if not owner or not repo:
-                yield event.plain_result("❌ 无法解析仓库地址")
-                return
-            
-            # 检查star状态
-            try:
-                starred = await self.github_client.check_star_status(owner, repo)
-                status = "已点star ⭐" if starred else "未点star ☆"
-            except RepositoryNotFoundError:
-                status = "仓库不存在 ❌"
-            except NotStarredError:
-                status = "未点star ☆"
-            except NetworkError:
-                status = "检查失败 ⚠️ (网络错误)"
-            except Exception as e:
-                logger.warning(f"检查star状态失败: {e}")
-                status = "检查失败 ⚠️"
-            result = f"📦 [{plugin.plugin_id}] {plugin.short_name}\n"
-            result += f"👤 作者: {plugin.author}\n"
-            result += f"⭐ 当前Stars: {plugin.stars}\n"
-            result += f"状态: {status}"
-            
-            yield event.plain_result(result)
-            
-        except Exception as e:
-            logger.error(f"检查star状态失败: {e}")
-            yield event.plain_result(f"❌ 检查失败: {str(e)}")
-    
     @filter.command("my_github")
     @require_permission
     async def my_github(self, event: AstrMessageEvent):
@@ -1256,9 +1199,376 @@ class GitHubStarManager(Star):
 
 📋 配置概览:
 GitHub Token: {'已配置' if self.config.get('github_token') else '未配置'}
-请求超时: {self.config.get('api_settings', {}).get('request_timeout', 15)}秒"""
+请求超时: {self.config.get('api_settings', {}).get('request_timeout', 20)}秒"""
         
         yield event.plain_result(debug_info)
+    
+    def _match_installed_with_github_plugins(self, installed_plugins: list) -> list:
+        """
+        将已安装插件与GitHub插件库进行匹配
+        
+        Args:
+            installed_plugins: 已安装插件的StarMetadata列表
+            
+        Returns:
+            list: 匹配成功的插件信息列表，包含GitHub插件库的ID
+        """
+        matched_plugins = []
+        
+        for installed in installed_plugins:
+            # 获取已安装插件信息
+            installed_name = getattr(installed, 'name', '')
+            installed_repo = getattr(installed, 'repo', '')
+            installed_author = getattr(installed, 'author', '')
+            
+            if not installed_name:
+                continue
+                
+            # 尝试在GitHub插件库中找到匹配的插件
+            matching_github_plugin = None
+            
+            # 方法1: 通过repo地址精确匹配
+            if installed_repo:
+                for github_plugin in self.plugin_db.plugins:
+                    if github_plugin.repo_url and installed_repo:
+                        # 标准化仓库地址进行比较
+                        github_repo_normalized = github_plugin.repo_url.lower().rstrip('/')
+                        installed_repo_normalized = installed_repo.lower().rstrip('/')
+                        
+                        # 移除.git后缀
+                        if github_repo_normalized.endswith('.git'):
+                            github_repo_normalized = github_repo_normalized[:-4]
+                        if installed_repo_normalized.endswith('.git'):
+                            installed_repo_normalized = installed_repo_normalized[:-4]
+                        
+                        if github_repo_normalized == installed_repo_normalized:
+                            matching_github_plugin = github_plugin
+                            break
+            
+            # 方法2: 如果repo地址匹配失败，尝试通过插件名匹配
+            if not matching_github_plugin:
+                for github_plugin in self.plugin_db.plugins:
+                    if github_plugin.name.lower() == installed_name.lower():
+                        matching_github_plugin = github_plugin
+                        break
+            
+            # 方法3: 尝试通过作者+插件名组合匹配
+            if not matching_github_plugin and installed_author:
+                for github_plugin in self.plugin_db.plugins:
+                    if (github_plugin.author.lower() == installed_author.lower() and 
+                        github_plugin.name.lower() == installed_name.lower()):
+                        matching_github_plugin = github_plugin
+                        break
+            
+            # 构建匹配结果
+            plugin_info = {
+                'installed_plugin': installed,
+                'name': installed_name,
+                'author': installed_author,
+                'version': getattr(installed, 'version', ''),
+                'repo_url': installed_repo,
+                'github_plugin': matching_github_plugin,
+                'plugin_id': matching_github_plugin.plugin_id if matching_github_plugin else None,
+                'is_matched': matching_github_plugin is not None
+            }
+            
+            matched_plugins.append(plugin_info)
+        
+        return matched_plugins
+    
+    @filter.command("list_installed")
+    @require_permission
+    async def list_installed(self, event: AstrMessageEvent, page: int = 1):
+        """
+        显示已安装插件及其star状态（支持分页）
+        
+        Args:
+            page: 页码（默认第1页）
+        """
+        try:
+            await self.initialize()
+            if not self.initialized:
+                yield event.plain_result("❌ 插件未正确初始化")
+                return
+            
+            yield event.plain_result("🔍 正在获取已安装插件列表...")
+            
+            # 获取已安装插件
+            all_stars = self.context.get_all_stars()
+            if not all_stars:
+                yield event.plain_result("❌ 未获取到任何已安装插件")
+                return
+            
+            # 更新GitHub插件数据库（如果需要）
+            await self.plugin_db.update_if_needed()
+            
+            # 匹配已安装插件与GitHub插件库
+            matched_plugins = self._match_installed_with_github_plugins(all_stars)
+            
+            if not matched_plugins:
+                yield event.plain_result("❌ 插件匹配失败")
+                return
+            
+            # 分页设置
+            page_size = 8
+            total_pages = (len(matched_plugins) + page_size - 1) // page_size
+            if page < 1:
+                page = 1
+            elif page > total_pages:
+                page = total_pages
+            
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_plugins = matched_plugins[start_idx:end_idx]
+            
+            yield event.plain_result("⏳ 检查star状态中...")
+            
+            # 构建显示结果
+            result = f"🔍 已安装插件列表 - 共{len(matched_plugins)}个插件 (第{page}/{total_pages}页):\n\n"
+            
+            # 分类统计
+            github_matched = sum(1 for p in matched_plugins if p['is_matched'])
+            local_only = len(matched_plugins) - github_matched
+            
+            result += f"📊 分类统计: GitHub插件 {github_matched}个 | 本地插件 {local_only}个\n\n"
+            
+            for plugin_info in page_plugins:
+                if plugin_info['is_matched']:
+                    # GitHub插件，显示ID和star状态
+                    plugin_id = plugin_info['plugin_id']
+                    
+                    # 检查star状态
+                    star_status = "⚠️"  # 默认状态
+                    try:
+                        owner, repo = self.github_client._parse_repo_url(plugin_info['repo_url'])
+                        if owner and repo:
+                            is_starred = await self.github_client.check_star_status(owner, repo)
+                            star_status = "⭐" if is_starred else "☆"
+                        else:
+                            logger.debug(f"无法解析仓库地址: {plugin_info['repo_url']}")
+                            star_status = "⚠️"
+                    except NotStarredError:
+                        # 仓库存在但未被star
+                        star_status = "☆"
+                    except RepositoryNotFoundError:
+                        # 仓库不存在
+                        logger.debug(f"仓库不存在: {plugin_info['repo_url']}")
+                        star_status = "⚠️"
+                    except (AuthenticationError, PermissionError) as e:
+                        # Token认证或权限问题
+                        logger.debug(f"GitHub认证/权限错误: {e}")
+                        star_status = "⚠️"
+                    except (RateLimitError, NetworkError) as e:
+                        # 网络问题或API限流
+                        logger.debug(f"网络错误: {e}")
+                        star_status = "⚠️"
+                    except Exception as e:
+                        logger.debug(f"检查{plugin_info['name']}的star状态失败: {e}")
+                        star_status = "⚠️"
+                    
+                    result += f"[{plugin_id}] 📦 {plugin_info['name']} {star_status}\n"
+                    result += f"    👤 {plugin_info['author']} | 🏷️ {plugin_info['version']}\n"
+                    result += f"    🔗 {plugin_info['repo_url']}\n\n"
+                else:
+                    # 本地插件，不显示ID
+                    result += f"🔧 {plugin_info['name']} (本地插件)\n"
+                    result += f"    👤 {plugin_info['author']} | 🏷️ {plugin_info['version']}\n"
+                    if plugin_info['repo_url']:
+                        result += f"    🔗 {plugin_info['repo_url']} (未在GitHub插件库中找到)\n"
+                    result += "\n"
+            
+            # 分页导航
+            if total_pages > 1:
+                result += f"📄 第{page}/{total_pages}页"
+                if page < total_pages:
+                    result += f" | 下一页: /list_installed {page + 1}"
+                if page > 1:
+                    result += f" | 上一页: /list_installed {page - 1}"
+                result += "\n\n"
+            
+            result += "💡 使用说明:\n"
+            result += "• /star_plugin <ID> - 给指定插件点star\n"
+            result += "• /starall - 批量star所有GitHub插件\n"
+            result += "• ⭐ = 已star | ☆ = 未star | ⚠️ = 无法检查"
+            
+            yield event.plain_result(result)
+            
+        except Exception as e:
+            logger.error(f"获取已安装插件列表失败: {e}")
+            yield event.plain_result(f"❌ 操作失败: {str(e)}")
+    
+    @filter.command("starall")
+    @require_permission
+    async def star_all_installed(self, event: AstrMessageEvent):
+        """
+        批量star所有已安装的GitHub插件
+        """
+        try:
+            await self.initialize()
+            if not self.initialized:
+                yield event.plain_result("❌ 插件未正确初始化")
+                return
+            
+            yield event.plain_result("🌟 开始批量star操作...")
+            
+            # 获取已安装插件
+            all_stars = self.context.get_all_stars()
+            if not all_stars:
+                yield event.plain_result("❌ 未获取到任何已安装插件")
+                return
+            
+            # 更新GitHub插件数据库
+            await self.plugin_db.update_if_needed()
+            
+            # 匹配已安装插件与GitHub插件库
+            matched_plugins = self._match_installed_with_github_plugins(all_stars)
+            
+            # 过滤出GitHub插件（有ID的）
+            github_plugins = [p for p in matched_plugins if p['is_matched']]
+            local_plugins = [p for p in matched_plugins if not p['is_matched']]
+            
+            # 添加github_star_manager插件本身（确保包含在批量star中）
+            github_star_manager_plugin = None
+            for plugin in self.plugin_db.plugins:
+                if plugin.name.lower() == "github_star_manager" or "github_star_manager" in plugin.name.lower():
+                    github_star_manager_plugin = plugin
+                    break
+            
+            # 如果找到了github_star_manager插件且不在已安装列表中，添加它
+            if github_star_manager_plugin:
+                # 检查是否已经在已安装列表中
+                already_included = any(p.get('plugin_id') == github_star_manager_plugin.plugin_id for p in github_plugins)
+                if not already_included:
+                    github_plugins.append({
+                        'name': github_star_manager_plugin.name,
+                        'author': github_star_manager_plugin.author,
+                        'repo_url': github_star_manager_plugin.repo_url,
+                        'plugin_id': github_star_manager_plugin.plugin_id,
+                        'is_matched': True,
+                        'github_plugin': github_star_manager_plugin
+                    })
+            
+            if not github_plugins:
+                yield event.plain_result("❌ 没有找到可以star的GitHub插件")
+                return
+            
+            # 显示统计信息
+            status_msg = f"扫描已安装插件: {len(matched_plugins)}个\n"
+            status_msg += f"匹配到GitHub库: {len(github_plugins)}个\n"
+            status_msg += f"跳过本地插件: {len(local_plugins)}个\n\n"
+            status_msg += "检查star状态..."
+            
+            yield event.plain_result(status_msg)
+            
+            # 检查每个插件的star状态
+            to_star = []
+            already_starred = []
+            check_failed = []
+            
+            for i, plugin_info in enumerate(github_plugins, 1):
+                try:
+                    owner, repo = self.github_client._parse_repo_url(plugin_info['repo_url'])
+                    if owner and repo:
+                        # 检查是否已star
+                        is_starred = await self.github_client.check_star_status(owner, repo)
+                        if is_starred:
+                            already_starred.append(plugin_info)
+                        else:
+                            to_star.append(plugin_info)
+                    else:
+                        logger.debug(f"无法解析仓库地址: {plugin_info['repo_url']}")
+                        check_failed.append(plugin_info)
+                        
+                except NotStarredError:
+                    # 仓库存在但未star
+                    to_star.append(plugin_info)
+                except RepositoryNotFoundError:
+                    logger.debug(f"仓库不存在: {plugin_info['repo_url']}")
+                    check_failed.append(plugin_info)
+                except Exception as e:
+                    logger.debug(f"检查{plugin_info['name']}的star状态失败: {e}")
+                    check_failed.append(plugin_info)
+            
+            # 显示检查结果
+            check_result = f"📊 Star状态检查完成:\n"
+            check_result += f"需要star: {len(to_star)}个\n"
+            check_result += f"已经star: {len(already_starred)}个\n"
+            check_result += f"检查失败: {len(check_failed)}个\n\n"
+            
+            if not to_star:
+                check_result += "🎉 所有GitHub插件都已经star了！"
+                yield event.plain_result(check_result)
+                return
+            
+            check_result += "🚀 正在为您的插件点赞中，请耐心等待... (￣▽￣)~*"
+            yield event.plain_result(check_result)
+            
+            # 批量star操作（静默执行）
+            success_count = 0
+            failed_count = 0
+            success_plugins = []
+            failed_plugins = []
+            
+            for i, plugin_info in enumerate(to_star, 1):
+                try:
+                    plugin_name = plugin_info['name']
+                    plugin_id = plugin_info.get('plugin_id', 'N/A')
+                    
+                    owner, repo = self.github_client._parse_repo_url(plugin_info['repo_url'])
+                    if owner and repo:
+                        success = await self.github_client.star_repository(owner, repo)
+                        if success:
+                            success_count += 1
+                            success_plugins.append(f"✅ {plugin_name}")
+                        else:
+                            failed_count += 1
+                            failed_plugins.append(f"❌ {plugin_name} - star失败")
+                    else:
+                        failed_count += 1
+                        failed_plugins.append(f"❌ {plugin_name} - 无法解析仓库地址")
+                        
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"star插件 {plugin_info['name']} 失败: {e}")
+                    failed_plugins.append(f"❌ {plugin_info['name']} - 异常: {str(e)}")
+                
+                # 添加小延迟避免API限流
+                if i < len(to_star):  # 不是最后一个
+                    await asyncio.sleep(0.5)
+            
+            # 最终统计报告
+            final_report = f"\n📊 批量star操作完成:\n\n"
+            
+            # 显示成功列表
+            if success_plugins:
+                final_report += f"🌟 成功star ({success_count}个):\n"
+                for plugin in success_plugins:
+                    final_report += f"  {plugin}\n"
+                final_report += "\n"
+            
+            # 显示失败列表  
+            if failed_plugins:
+                final_report += f"❌ 失败列表 ({failed_count}个):\n"
+                for plugin in failed_plugins:
+                    final_report += f"  {plugin}\n"
+                final_report += "\n"
+            
+            # 统计汇总
+            final_report += f"📈 汇总统计:\n"
+            final_report += f"✅ 成功: {success_count}个\n"
+            final_report += f"❌ 失败: {failed_count}个\n"
+            final_report += f"⏭️ 跳过: {len(already_starred)}个 (已star)\n"
+            final_report += f"⚠️ 忽略: {len(check_failed)}个 (检查失败)\n"
+            final_report += f"🔧 本地插件: {len(local_plugins)}个 (无GitHub仓库)\n\n"
+            
+            if success_count > 0:
+                final_report += f"🎉 感谢您为{success_count}个AstrBot插件点star！"
+            
+            yield event.plain_result(final_report)
+            
+        except Exception as e:
+            logger.error(f"批量star操作失败: {e}")
+            yield event.plain_result(f"❌ 批量star操作失败: {str(e)}")
     
     @filter.command("test_network")
     @require_permission
